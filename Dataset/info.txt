@@ -1,0 +1,8 @@
+Each feature (e.g., C3_Wavelet_F1) represents a scalar summary statistic extracted from a time window of EEG signal, such as:
+
+Mean wavelet power in a specific frequency band
+Energy or variance in that frequency band
+Coefficient value from the wavelet transform
+
+EEG data are originally time-series signals, but they are compressed into feature vectors to make them suitable for machine learning models (like LDA, SVM, CNN, etc.).
+That’s why each column is a single scalar per trial instead of a range or array of values.
