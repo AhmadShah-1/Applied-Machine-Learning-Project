@@ -7,6 +7,7 @@ import math
 from contextlib import AbstractContextManager
 from typing import Any, Optional
 
+
 from drone_config import DroneConfig
 
 

@@ -195,5 +195,4 @@ if __name__ == "__main__":
     print("\nSaved model and metadata to:")
     print(f" - {model_out_dir / 'eeg_intent_model.joblib'}")
     print(f" - {model_out_dir / 'eeg_intent_model.meta.json'}")
-
-
+    
