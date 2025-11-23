@@ -1,0 +1,21 @@
+AOxT are used for training 
+AOxE are used for validation by judges 
+
+
+The location for the lablel data is in the gdf header, so those with the label data are stored in "Trials"
+
+all CSVs of both E and T are stored in "CSV" but nethier contain the label data, just there for now until needed
+
+User Trials for training and validation
+
+There are 4 states (Event Codes: [769, 770, 7712, 772]) these mean respectively [Left-hand cue, Right-hand cue, feet cue, tongue cue]
+which i remapped to be class labels [1, 2, 3, 4]
+
+Attached is also the detailed description of the project, from my understanding they aren't asked to move their body parts, but rather
+to visualize moving it in their heads. (MOTOR IMAGERY) this is for the system to recognize thought, and not motion, to avoid muscle artifacts
+
+The file contains EEG and 3 EOG channels (left, central, right) 
+
+Avoid using EOG channels, they are being used to detect eye movements, and because of the high electrical potential it theoretically will always
+be the root to all trees (if using random forest), and as different individuals may look right or left unconciously, it will skew 
+uncertainity into the dataset, paired with the high electrical potential, it would be best to ignore these 3 channels.
