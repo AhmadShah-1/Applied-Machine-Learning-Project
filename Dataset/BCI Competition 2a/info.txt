@@ -19,3 +19,5 @@ The file contains EEG and 3 EOG channels (left, central, right)
 Avoid using EOG channels, they are being used to detect eye movements, and because of the high electrical potential it theoretically will always
 be the root to all trees (if using random forest), and as different individuals may look right or left unconciously, it will skew 
 uncertainity into the dataset, paired with the high electrical potential, it would be best to ignore these 3 channels.
+
+https://www.bbci.de/competition/iv/
