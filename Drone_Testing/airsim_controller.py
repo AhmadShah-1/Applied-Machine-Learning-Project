@@ -18,7 +18,7 @@ class AirSimUnavailableError(RuntimeError):
 def _load_airsim() -> Any:
     try:
         return importlib.import_module("airsim")
-    except ImportError as exc:  # pragma: no cover - exercised only when AirSim missing
+    except ImportError as exc: 
         raise AirSimUnavailableError(
             "The 'airsim' package is required but not installed. "
             "Install it with 'pip install airsim==1.8.1 --no-build-isolation'."
@@ -26,8 +26,6 @@ def _load_airsim() -> Any:
 
 
 class AirSimDroneController(AbstractContextManager["AirSimDroneController"]):
-    """Utility that encapsulates connection and simple motion commands for a drone."""
-
     def __init__(self, config: Optional[DroneConfig] = None) -> None:
         self._airsim = _load_airsim()
         self.config = config or DroneConfig()
@@ -37,26 +35,30 @@ class AirSimDroneController(AbstractContextManager["AirSimDroneController"]):
         self.client.enableApiControl(True)
         self.client.armDisarm(True)
 
-        # AirSim uses NED coordinates with negative Z above ground.
         self._hover_z = -abs(self.config.hover_height)
 
-    # ------------------------------------------------------------------
-    # Context manager helpers
     def __enter__(self) -> "AirSimDroneController":
         return self
 
-    def __exit__(self, exc_type, exc, exc_tb) -> Optional[bool]:  # pragma: no cover - cleanup
+    def __exit__(self, exc_type, exc, exc_tb) -> Optional[bool]:  
         self.shutdown()
         return None
 
-    # ------------------------------------------------------------------
     # Drone motion commands
     def takeoff_and_hover(self) -> None:
         self.client.takeoffAsync().join()
         self.client.moveToZAsync(self._hover_z, self.config.speed).join()
 
     def move_direction(self, direction: str) -> None:
-        dx, dy, dz = self.config.displacement_for_direction(direction)
+        # expecting tuple (dx, dy, dz, yaw)
+        dx, dy, dz, yaw = self.config.displacement_for_direction(direction)
+        
+        # If it's a rotation command (yaw != 0)
+        if yaw != 0:
+            self.rotate_by_yaw(yaw)
+            return
+
+        # Otherwise standard movement
         distance = math.sqrt(dx**2 + dy**2 + dz**2)
         if distance == 0:
             return
@@ -70,6 +72,14 @@ class AirSimDroneController(AbstractContextManager["AirSimDroneController"]):
         self.client.moveByVelocityZAsync(vx, vy, target_z, duration).join()
         self.client.hoverAsync().join()
 
+    def rotate_by_yaw(self, yaw_degrees: float) -> None:
+        """Rotates the drone in place by a relative yaw angle (in degrees)."""
+        duration = 2.0  # seconds to complete turn
+        yaw_rate = yaw_degrees / duration
+        
+        self.client.rotateByYawRateAsync(yaw_rate, duration).join()
+        self.client.hoverAsync().join()
+
     def land(self) -> None:
         self.client.landAsync().join()
 
@@ -81,4 +91,3 @@ class AirSimDroneController(AbstractContextManager["AirSimDroneController"]):
 
 
 __all__ = ["AirSimDroneController", "AirSimUnavailableError"]
-

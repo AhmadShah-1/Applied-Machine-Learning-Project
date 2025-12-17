@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import json
-import re
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Tuple
 
-import joblib  # type: ignore[import]
+import joblib
+import numpy as np
+import pandas as pd
+from mne.filter import filter_data
 
 from airsim_controller import AirSimDroneController, AirSimUnavailableError
 from drone_config import DroneConfig
@@ -21,14 +23,13 @@ def get_project_root() -> Path:
     for parent in resolved.parents:
         if (parent / "Model_Training").exists() and (parent / "Dataset").exists():
             return parent
-    # Fallback: assume two levels up to keep previous behaviour.
     return resolved.parents[1]
 
 
 PROJECT_ROOT = get_project_root()
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "Model_Training" / "LogtisticRegression_RandomForest" / "models" / "eeg_intent_model.joblib"
-DEFAULT_META_PATH = DEFAULT_MODEL_PATH.with_suffix(".meta.json")
-DEFAULT_DATA_PATH = PROJECT_ROOT / "Dataset" / "Modified" / "directions" / "Move.xlsx"
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "Model_Training" / "RandomForest" / "BCI_Competetion" / "models" / "csp_rf_model_v2.joblib"
+# Default to the first subject's trials if available, otherwise fallback
+DEFAULT_DATA_PATH = PROJECT_ROOT / "Dataset" / "BCI Competition 2a" / "Trials" / "A01T_trials.csv"
 
 
 class NullDroneController:
@@ -40,7 +41,7 @@ class NullDroneController:
     def __enter__(self) -> "NullDroneController":
         return self
 
-    def __exit__(self, exc_type, exc, exc_tb) -> Optional[bool]:  # pragma: no cover - trivial
+    def __exit__(self, exc_type, exc, exc_tb) -> Optional[bool]:
         return None
 
     def takeoff_and_hover(self) -> None:
@@ -59,99 +60,127 @@ class NullDroneController:
 @dataclass
 class IntentModel:
     model_path: Path
-    expected_features: Optional[int] = None
+    # The new pipeline model expects (n_epochs, n_channels, n_times)
+    # We expect 22 channels and 1000 timepoints
+    expected_channels: int = 22
+    expected_times: int = 1000
+
+    # Filter settings (same from training), we need to apply the filters on the data again
+    sfreq: float = 250.0
+    l_freq: float = 8.0
+    h_freq: float = 30.0
 
     def __post_init__(self) -> None:
+        print(f"Loading model from {self.model_path}...")
         self._model = joblib.load(self.model_path)
 
-    def predict_label(self, features: Sequence[float]) -> int:
-        if self.expected_features is not None and len(features) != self.expected_features:
-            raise ValueError(
-                f"Model expects {self.expected_features} features but received {len(features)}."
-            )
+    def predict_label(self, trial_data: np.ndarray) -> int:
+        if trial_data.ndim == 2:
+            trial_data = trial_data[np.newaxis, :, :]
+        
+        if trial_data.shape[1] != self.expected_channels:
+             raise ValueError(f"Expected {self.expected_channels} channels, got {trial_data.shape[1]}")
 
-        prediction = self._model.predict([features])[0]
+        # Handle time dimension mismatch by padding or trimming
+        current_times = trial_data.shape[2]
+        if current_times != self.expected_times:
+            if current_times < self.expected_times:
+                # Pad with zeros
+                pad_width = ((0, 0), (0, 0), (0, self.expected_times - current_times))
+                trial_data = np.pad(trial_data, pad_width, mode='constant')
+                warnings.warn(f"Input data padded from {current_times} to {self.expected_times} samples.")
+            else:
+                # Trim
+                trial_data = trial_data[:, :, :self.expected_times]
+                warnings.warn(f"Input data trimmed from {current_times} to {self.expected_times} samples.")
+
+        # APPLY BANDPASS FILTER (8-30Hz)
+        trial_data = filter_data(
+            trial_data, 
+            sfreq=self.sfreq, 
+            l_freq=self.l_freq, 
+            h_freq=self.h_freq, 
+            verbose=False
+        )
+
+        prediction = self._model.predict(trial_data)[0]
         return int(prediction)
 
-    def predict_probabilities(self, features: Sequence[float]) -> Optional[Sequence[float]]:
+    def predict_probabilities(self, trial_data: np.ndarray) -> Optional[Sequence[float]]:
+        if trial_data.ndim == 2:
+            trial_data = trial_data[np.newaxis, :, :]
+            
+        current_times = trial_data.shape[2]
+        if current_times < self.expected_times:
+             pad_width = ((0, 0), (0, 0), (0, self.expected_times - current_times))
+             trial_data = np.pad(trial_data, pad_width, mode='constant')
+        elif current_times > self.expected_times:
+             trial_data = trial_data[:, :, :self.expected_times]
+
+        # Apply same filter for probabilities
+        trial_data = filter_data(
+            trial_data, 
+            sfreq=self.sfreq, 
+            l_freq=self.l_freq, 
+            h_freq=self.h_freq, 
+            verbose=False
+        )
+
         predict_proba = getattr(self._model, "predict_proba", None)
         if predict_proba is None:
             return None
-        probs = predict_proba([features])[0]
+        probs = predict_proba(trial_data)[0]
         return [float(p) for p in probs]
 
 
-def load_metadata(meta_path: Optional[Path]) -> Tuple[Optional[int], Optional[List[str]]]:
-    if meta_path is None or not meta_path.exists():
-        return None, None
+def iter_trials_randomly(data_dir: Path) -> Iterator[Tuple[str, np.ndarray, int]]:
+    # Map input keys to filenames
+    key_to_file = {
+        'a': "left.csv",
+        'd': "right.csv",
+        's': "backward.csv",
+        'w': "forward.csv"
+    }
 
-    metadata = json.loads(meta_path.read_text())
-    feature_columns = metadata.get("feature_columns")
-    n_features = metadata.get("n_features")
-    return n_features, feature_columns
+    # load all dataframes so we don;t have to keep reading from disk every time
+    dfs = {}
+    print("Pre-loading datasets...")
+    for key, filename in key_to_file.items():
+        path = data_dir / filename
+        if path.exists():
+            df = pd.read_csv(path)
+            dfs[key] = [group for _, group in df.groupby("Trial_ID")]
+            print(f"Loaded {len(dfs[key])} trials from {filename}")
+        else:
+            print(f"Warning: {filename} not found in {data_dir}")
 
-
-def iter_sample_rows(data_path: Path) -> Iterator[Tuple[int, List[float], int]]:
-    if not data_path.exists():
-        raise FileNotFoundError(f"Dataset not found at {data_path}")
-
-    suffix = data_path.suffix.lower()
-    if suffix in {".xlsx", ".xls"}:
-        try:
-            import pandas as pd
-        except ImportError as exc:  # pragma: no cover - depends on optional dependency
-            raise RuntimeError(
-                "Reading Excel data requires pandas. Install it with 'pip install pandas'."
-            ) from exc
-
-        df = pd.read_excel(data_path)
-        for idx, (_, row) in enumerate(df.iterrows(), start=1):
-            raw_values = [value for value in row.tolist() if pd.notna(value)]
-            if len(raw_values) < 3:
-                continue
-
-            try:
-                numeric = [float(value) for value in raw_values[2:]]
-            except ValueError as exc:
-                raise ValueError(f"Row {idx} contains non-numeric data: {raw_values}") from exc
-
-            if len(numeric) < 1:
-                continue
-
-            *feature_values, target_value = numeric
-            target_label = int(round(target_value))
-            yield idx, feature_values, target_label
-        return
-
-    pattern = re.compile(r"[\s,]+")
-    with data_path.open("r", encoding="utf-8") as handle:
-        for idx, raw_line in enumerate(handle, start=1):
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-
-            tokens = [token for token in pattern.split(stripped) if token]
-            if len(tokens) < 3:
-                continue
-
-            payload = tokens[2:]
-
-            try:
-                values = [float(token) for token in payload]
-            except ValueError:
-                if idx == 1:
-                    # Treat the first line as an optional header.
-                    continue
-                raise
-
-            if len(values) < 1:
-                raise ValueError(
-                    f"Row {idx} does not contain enough values to parse features and target after removing IDs."
-                )
-
-            *feature_values, target_value = values
-            target_label = int(round(target_value))
-            yield idx, feature_values, target_label
+    while True:
+        prompt = input("\nPress (w/a/s/d) to pick a trial direction, or 'q' to quit > ").lower().strip()
+        
+        if prompt == 'q':
+            break
+            
+        if prompt not in dfs:
+            print(f"Invalid input. Use w, a, s, d. (Available: {list(dfs.keys())})")
+            continue
+            
+        # Pick a random trial from the selected direction
+        trials = dfs[prompt]
+        if not trials:
+            print("No trials available for this direction.")
+            continue
+            
+        import random
+        trial_df = random.choice(trials)
+        
+        # Process trial
+        eeg_cols = [c for c in trial_df.columns if c.startswith("EEG")]
+        features_T = trial_df[eeg_cols].to_numpy()
+        features = features_T.T
+        label = int(trial_df["Label"].iloc[0])
+        
+        source_name = key_to_file[prompt]
+        yield source_name, features, label
 
 
 def choose_controller(config: DroneConfig, dry_run: bool) -> Tuple[object, bool]:
@@ -167,47 +196,52 @@ def choose_controller(config: DroneConfig, dry_run: bool) -> Tuple[object, bool]
 
 def replay_model(
     model_path: Path,
-    data_path: Path,
-    meta_path: Optional[Path] = None,
+    data_path: Path, 
     *,
     dry_run: bool = False,
 ) -> None:
-    n_features, feature_columns = load_metadata(meta_path)
     config = DroneConfig()
-    intent_model = IntentModel(model_path=model_path, expected_features=n_features)
+    intent_model = IntentModel(model_path=model_path)
     controller, is_dry_run = choose_controller(config, dry_run=dry_run)
 
-    if feature_columns:
-        print(f"Using feature columns: {', '.join(feature_columns)}")
+    if data_path.is_file():
+        print("Single file provided, running sequential replay...")
+        data_dir = data_path.parent
+    else:
+        data_dir = data_path
 
     with controller as drone:
         try:
             drone.takeoff_and_hover()
 
-            for row_idx, features, target in iter_sample_rows(data_path):
-                prompt = input(
-                    f"Row {row_idx}: press Enter to send command or 'q' to quit > "
-                ).strip()
-                if prompt.lower().startswith("q"):
-                    print("Stopping replay.")
-                    break
+            for source_name, features, target in iter_trials_randomly(data_dir):
+                try:
+                    prediction = intent_model.predict_label(features)
+                    probs = intent_model.predict_probabilities(features)
+                    
+                    predicted_direction = DroneConfig.direction_from_target(prediction)
+                    try:
+                        target_direction = DroneConfig.direction_from_target(target)
+                    except ValueError:
+                        target_direction = f"Unknown({target})"
 
-                prediction = intent_model.predict_label(features)
-                predicted_direction = DroneConfig.direction_from_target(prediction)
-                target_direction = DroneConfig.direction_from_target(target)
-                probs = intent_model.predict_probabilities(features)
+                    print(f"\nSource: {source_name}")
+                    print(f"Predicted: {prediction} ({predicted_direction})")
+                    print(f"Ground Truth: {target} ({target_direction})")
+                    
+                    if probs is not None:
+                        print("Probabilities:", ", ".join(f"{p:.3f}" for p in probs))
 
-                print(f"Predicted: {prediction} -> {predicted_direction}")
-                print(f"Ground truth: {target} -> {target_direction}")
-                if probs is not None:
-                    print("Probabilities:", ", ".join(f"{p:.3f}" for p in probs))
+                    if prediction == target:
+                        print("Result: MATCH")
+                    else:
+                        print("Result: MISMATCH")
 
-                if prediction == target:
-                    print("Comparison: match")
-                else:
-                    print("Comparison: mismatch")
-
-                drone.move_direction(predicted_direction)
+                    drone.move_direction(predicted_direction)
+                    
+                except ValueError as e:
+                    print(f"Error processing trial: {e}")
+                    continue
 
             if not is_dry_run:
                 drone.land()
@@ -224,16 +258,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=f"Path to the trained model joblib file (default: {DEFAULT_MODEL_PATH}).",
     )
     parser.add_argument(
-        "--meta-path",
-        type=Path,
-        default=DEFAULT_META_PATH,
-        help=f"Path to the metadata JSON file (default: {DEFAULT_META_PATH}).",
-    )
-    parser.add_argument(
         "--data-path",
         type=Path,
-        default=DEFAULT_DATA_PATH,
-        help=f"Path to the replay dataset (default: {DEFAULT_DATA_PATH}).",
+        default=PROJECT_ROOT / "Drone_Testing" / "MovementCSV", 
+        help=f"Path to the directory containing direction CSVs (default: Drone_Testing/MovementCSV).",
     )
     parser.add_argument(
         "--dry-run",
@@ -248,11 +276,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     replay_model(
         model_path=args.model_path,
         data_path=args.data_path,
-        meta_path=args.meta_path,
         dry_run=args.dry_run,
     )
 
 
 if __name__ == "__main__":
     main()
-
